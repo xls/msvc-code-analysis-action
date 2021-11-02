@@ -3,6 +3,7 @@
 const core = require('@actions/core');
 const exec = require('@actions/exec');
 const fs = require('fs');
+const yaml = require('js-yaml');
 const io = require('@actions/io');
 const path = require('path');
 const tmp = require('tmp');
@@ -680,25 +681,28 @@ function combineSarif(resultPath, sarifFiles) {
   const combinedSarif = {
     "version": "2.1.0",
     "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
-    "runs": [{
-      "tool": null,
-      "results": []
-    }]
+    "runs": []
   };
 
   for (const sarifFile of sarifFiles) {
     const sarifLog = parseReplyFile(sarifFile);
+    var addRun = {
+      "tool": null,
+      "results": []
+    }
     for (const run of sarifLog.runs) {
-      if (!combinedSarif.runs[0].tool) {
-        combinedSarif.runs[0].tool = run.tool;
+      if (!addRun.tool) {
+        addRun.tool = run.tool;
       }
 
       for (const result of run.results) {
         if (resultCache.addIfUnique(result)) {
-          combinedSarif.runs[0].results.push(result);
+          addRun.results.push(result);
         }
       }
     }
+    combinedSarif.runs.push(addRun);
+
   }
 
   try {
@@ -708,6 +712,22 @@ function combineSarif(resultPath, sarifFiles) {
   }
 }
 
+function linefromOffset(sourceFile, offset) {
+    try {
+        var text = fs.readFileSync(sourceFile, 'utf8', true);
+        var lc = 1;
+        for (let i in text) {
+            if (text.charAt(i) == '\n')
+                lc++;
+            offset--;
+            if (offset == 0)
+                return lc;
+        }
+    } catch (error) {
+        return offset;
+    }
+
+}
 /**
  * Main
  */
@@ -750,6 +770,93 @@ async function main() {
         core.debug(execOptions.env);
         failedSourceFiles.push(command.source);
       }
+
+
+            try {
+                const execOptionsClangTidy = {
+                    cwd: buildDir,
+                    env: command.env,
+                    ignoreReturnCode: true
+                };
+                var clangtidyexe = command.compiler.substring(0, command.compiler.indexOf("/MSVC")).concat("/Llvm/x64/bin/clang-tidy.exe");
+
+                // another hack.. for testing purpose
+                const targetfile = `${command.sarifLog}` + ".ct.yml"
+                const args2 = ['--quiet', '--export-fixes=' + `${targetfile}`, '-p="' + `${buildDir}` + '"', '--checks="clang-analyzer-*,modernize-*,hicpp-*,misc-*,performance-*,readability-*,cppcoreguidelines-*,bugprone-*"', `${command.source}`];
+                // TOOD: use vcvars to find location of clang-tidy
+
+                await exec.exec("\"" + clangtidyexe + "\"", args2, execOptionsClangTidy);
+                var inputfile = targetfile,
+                    outputfile = `${command.sarifLog}` + ".ct.sarif",
+                    obj = yaml.load(fs.readFileSync(inputfile, { encoding: 'utf-8' }));
+
+                const convertSarif = {
+                    "version": "2.1.0",
+                    "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+                    "runs": []
+                }
+
+                var uriSourceFile = "file:///" + obj.MainSourceFile.replace(/\\/g, "/");
+
+                var run = {
+                    results: [],
+                    "tool": {
+                        "driver": {
+                            "name": "clang-tidy",
+                            "fullName": "clang tidy Code Analysis",
+                            "version": "1.0.0",
+                            "informationUri": "https://aka.ms/cpp/ca"
+                        }
+                    },
+                    "artifacts": [{
+                        "location": {
+                            "uri": uriSourceFile
+                        },
+                        "roles": [
+                            "analysisTarget",
+                            "resultFile"
+                        ],
+                        "hashes": {
+                            "sha-256": "4edbee9b247367c9972a3d9624da1d6e811b0cd5732a8ab37e21430d9350cb1e"
+                        }
+                    }]
+                };
+                for (const Diagnostic of obj.Diagnostics) {
+                    var d, reg;
+                    d = Diagnostic;
+                    //var reg;
+                    if (Diagnostic.DiagnosticMessage != undefined) {
+                        reg = {
+                            StartLine: linefromOffset(Diagnostic.DiagnosticMessage.FilePath, Diagnostic.DiagnosticMessage.FileOffset)
+                        }
+                    }
+
+                    const result = {
+                        ruleId: Diagnostic.DiagnosticName,
+                        message: { text: Diagnostic.DiagnosticMessage.Message },
+                        locations: [{
+                            physicalLocation: {
+                                artifactLocation: { uri: uriSourceFile },
+                                region: {
+                                    startLine: reg.StartLine,
+                                    startColumn: 1
+                                }
+
+                            }
+                        }],
+                    };
+                    run.results.push(result);
+                }
+                convertSarif.runs.push(run);
+
+                fs.writeFileSync(`${outputfile}`, JSON.stringify(convertSarif, null, 2));
+
+            } catch (err) {
+                core.debug(`clang-tidy failed with error: ${err}`);
+                core.debug("Environment:");
+                core.debug(execOptions.env);
+                failedSourceFiles.push(command.source);
+            }
     }
 
     if (failedSourceFiles.length > 0) {
@@ -759,7 +866,10 @@ async function main() {
       throw new Error(`Analysis failed due to compiler errors in files: ${fileList}`);
     }
 
-    const sarifResults = analyzeCommands.map(command => command.sarifLog);
+        const sarifResults1 = analyzeCommands.map(command => command.sarifLog);
+        // add clang-tidy output to the sarif results
+        const sarifResults = sarifResults1.concat(analyzeCommands.map(command => command.sarifLog + ".ct.sarif"));
+
     combineSarif(resultPath, sarifResults);
     core.setOutput("sarif", resultPath);
 
